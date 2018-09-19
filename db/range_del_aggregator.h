@@ -190,6 +190,51 @@ class RangeDelAggregator {
   const InternalKeyComparator& icmp_;
   // collapse range deletions so they're binary searchable
   const bool collapse_deletions_;
+
+  struct ClampedIterator {
+    std::unique_ptr<InternalIterator> it;
+    const InternalKey* smallest;
+    const InternalKey* largest;
+
+    // TODO: evaluate whether this needs to be an internal key or just a user key.
+    // Also this probably needs to store a comparator as well, plumbing it in all the
+    // time is messy
+    std::string cur_boundary;
+    bool iter_seeked = false;
+
+    ClampedIterator(std::unique_ptr<InternalIterator> _it,
+                    const InternalKey* _smallest, const InternalKey* _largest)
+        : it(std::move(_it)), smallest(_smallest), largest(_largest) {}
+
+    void SeekForPrev(const Slice& key, const Comparator* ucmp) {
+      it->SeekForPrev(key);
+      iter_seeked = true;
+
+      FindCurrentBoundary(ucmp);
+    }
+
+    void FindCurrentBoundary(const Comparator* ucmp) {
+      cur_boundary = it->value().ToString();
+      it->Next();
+      if (it->Valid() && ucmp->Compare(Slice(cur_boundary), ExtractUserKey(it->key())) > 0) {
+        cur_boundary = ExtractUserKey(it->key()).ToString();
+      }
+      it->Prev();
+    }
+
+    bool ShouldAdvance(const Slice& key, const Comparator* ucmp) {
+      return ucmp->Compare(key, Slice(cur_boundary)) >= 0 ||
+             (largest != nullptr &&
+              ucmp->Compare(key, largest->user_key()) > 0);
+    }
+
+    void Next(const Comparator* ucmp) {
+      it->Next();
+      FindCurrentBoundary(ucmp);
+    }
+  };
+
+  std::vector<std::unique_ptr<ClampedIterator>> tombstone_iters_;
 };
 
 }  // namespace rocksdb
