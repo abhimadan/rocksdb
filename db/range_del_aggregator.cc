@@ -173,8 +173,8 @@ class CollapsedRangeDelMap : public RangeDelMap {
   const Comparator* ucmp_;
 
  public:
-  explicit CollapsedRangeDelMap(const Comparator* ucmp) 
-    : rep_(stl_wrappers::LessOfComparator(ucmp)), 
+  explicit CollapsedRangeDelMap(const Comparator* ucmp)
+    : rep_(stl_wrappers::LessOfComparator(ucmp)),
       ucmp_(ucmp) {
     InvalidatePosition();
   }
@@ -407,13 +407,34 @@ bool RangeDelAggregator::ShouldDeleteImpl(const Slice& internal_key,
 
 bool RangeDelAggregator::ShouldDeleteImpl(const ParsedInternalKey& parsed,
                                           RangeDelPositioningMode mode) {
+  (void)mode;
   assert(IsValueType(parsed.type));
+
+  for (auto& tombstone_iter : tombstone_iters_) {
+    // TODO: consider how this would work with snapshots
+    if (!tombstone_iter->iter_seeked) {
+      tombstone_iter->it->SeekForPrev(parsed.user_key);
+    }
+    while (tombstone_iter->ShouldAdvance(parsed.user_key, icmp_.user_comparator())) {
+      tombstone_iter->Next(icmp_.user_comparator());
+    }
+    ParsedInternalKey parsed_start_key;
+    ParseInternalKey(tombstone_iter->it->key(), &parsed_start_key);
+    Slice end_key = tombstone_iter->it->value();
+    if (icmp_.Compare(parsed_start_key, parsed) <= 0 &&
+        icmp_.user_comparator()->Compare(parsed.user_key, end_key) < 0) {
+      return true;
+    }
+  }
+  return false;
+#if 0
   assert(rep_ != nullptr);
   auto& tombstone_map = GetRangeDelMap(parsed.sequence);
   if (tombstone_map.IsEmpty()) {
     return false;
   }
   return tombstone_map.ShouldDelete(parsed, mode);
+#endif
 }
 
 bool RangeDelAggregator::IsRangeOverlapped(const Slice& start,
@@ -436,6 +457,11 @@ Status RangeDelAggregator::AddTombstones(
     std::unique_ptr<InternalIterator> input,
     const InternalKey* smallest,
     const InternalKey* largest) {
+  ClampedIterator* iter = new ClampedIterator(std::move(input), smallest, largest);
+  tombstone_iters_.emplace_back(std::unique_ptr<ClampedIterator>(iter));
+  return Status::OK();
+
+#if 0
   if (input == nullptr) {
     return Status::OK();
   }
@@ -504,6 +530,7 @@ Status RangeDelAggregator::AddTombstones(
     rep_->pinned_iters_mgr_.PinIterator(input.release(), false /* arena */);
   }
   return Status::OK();
+#endif
 }
 
 void RangeDelAggregator::InvalidateRangeDelMapPositions() {
