@@ -21,6 +21,7 @@
 #include "table/scoped_arena_iterator.h"
 #include "table/table_builder.h"
 #include "util/kv_map.h"
+#include "util/heap.h"
 
 namespace rocksdb {
 
@@ -190,6 +191,108 @@ class RangeDelAggregator {
   const InternalKeyComparator& icmp_;
   // collapse range deletions so they're binary searchable
   const bool collapse_deletions_;
+
+  // TODO: move some of the definitions here to the .cc file
+  // TODO: this only assumes forward iteration for now, extend to reverse
+  // iteration later
+  // TODO: this should be stored in a heap, and UpdatePosition is only called on
+  // the top of the heap / before inserting into heap (what's passed to it?)
+  //    - alternatively, it's not added to the heap until ShouldDelete is called
+  class ClampedIterator {
+   public:
+    ClampedIterator(std::unique_ptr<InternalIterator> tombstone_iter,
+                    Comparator* ucmp, InternalKey* smallest = nullptr,
+                    InternalKey* largest = nullptr)
+        : tombstone_iter_(std::move(tombstone_iter)),
+          ucmp_(ucmp),
+          smallest_(smallest),
+          largest_(largest) {}
+
+    SequenceNumber sequence() const { return cur_seqnum_; }
+
+    Slice boundary() const { return next_range_boundary_; }
+
+    bool Valid() const { return valid_; }
+
+    // Must be called before adding to heap
+    void UpdatePosition(const ParsedInternalKey& parsed) {
+      // TODO: account for changing direction as well
+      bool updated_position = false;
+      if (!previously_seeked_) {
+        tombstone_iter_->SeekForPrev(parsed.user_key);
+        previously_seeked_ = true;
+        updated_position = true;
+      } else {
+        // After we've seeked, we expect this to be faster
+        while (tombstone_iter_->Valid() &&
+               ucmp_->Compare(ExtractUserKey(tombstone_iter_->key()),
+                              parsed.user_key) > 0) {
+          tombstone_iter_->Next();
+          updated_position = true;
+        }
+      }
+
+      if (!tombstone_iter_->Valid() ||
+          (largest != nullptr &&
+           ucmp_->Compare(largest->user_key(), parsed.user_key) < 0)) {
+        valid_ = false;
+        return;
+      }
+
+      if (updated_position) {
+        // TODO: check if pinned first; use a function to wrap this
+        pinned_next_range_boundary_ = tombstone_iter_->value().ToString();
+        next_range_boundary_ = pinned_next_range_boundary_;
+        tombstone_iter_->Next();
+        cur_seqnum_ = get_seqnum();
+        if (tombstone_iter_->Valid() &&
+            ucmp_->Compare(next_range_boundary_,
+                           ExtractUserKey(tombstone_iter_->key())) > 0) {
+          pinned_next_range_boundary_ =
+              ExtractUserKey(tombstone_iter_->key()).ToString();
+          next_range_boundary_ = pinned_next_range_boundary_;
+        }
+        tombstone_iter_->Prev();
+      } else if (ucmp_->Compare(tombstone_iter_->value(), parsed.user_key) <=
+                 0) {
+        cur_seqnum_ = 0;
+      }
+    }
+
+   private:
+    SequenceNumber get_seqnum() const {
+      return ExtractInternalKeyFooter(tombstone_iter_->key()) >> 8;
+    }
+
+    const std::unique_ptr<InternalIterator> tombstone_iter_;
+    const Comparator* ucmp_;
+    const InternalKey* smallest_;
+    const InternalKey* largest_;
+
+    Slice next_range_boundary_;
+    // used if keys/values aren't pinned by tombstone_iter_
+    std::string pinned_next_range_boundary_;
+    bool previously_seeked_ = false;
+    SequenceNumber cur_seqnum_ = 0;
+    bool valid_ = true;
+  };
+
+  struct ClampedIteratorForwardComparator {
+    ClampedIteratorComparator(const Comparator* c) : cmp(c) {}
+
+    bool operator()(ClampedIterator* a, ClampedIterator* b) const {
+      return cmp->Compare(a->boundary(), b->boundary()) > 0;
+    }
+
+    const Comparator* cmp;
+  };
+
+  typedef BinaryHeap<ClampedIterator*, ClampedIteratorForwardComparator>
+      ForwardIterHeap;
+  ForwardIterHeap forward_heap_;
+  // TODO: maintain a heap sorted by seqnum? might use priority_queue since replace_top won't be used
+  std::vector<std::unique_ptr<ClampedIterator>> iters_;
+  std::vector<ClampedIterator*> new_iters_;
 };
 
 }  // namespace rocksdb

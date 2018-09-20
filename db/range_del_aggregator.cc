@@ -408,12 +408,35 @@ bool RangeDelAggregator::ShouldDeleteImpl(const Slice& internal_key,
 bool RangeDelAggregator::ShouldDeleteImpl(const ParsedInternalKey& parsed,
                                           RangeDelPositioningMode mode) {
   assert(IsValueType(parsed.type));
+  // can only add new iters after this loop because they are seeked to latest key
+  while (icmp_.user_comparator()->Compare(forward_heap_.top()->boundary(),
+                                          parsed.user_key) <= 0) {
+    forward_heap_.top()->UpdatePosition(parsed);
+    if (!forward_heap_.top()->Valid()) {
+      forward_heap_.pop();
+      // TODO: remove from iters_ as well
+    }
+    forward_heap_.replace_top();
+  }
+  for (auto new_iter : new_iters_) {
+    new_iter.UpdatePosition(parsed);
+    forward_heap_.push(new_iter);
+  }
+  new_iters_.clear();
+  SequenceNumber max_seqnum = 0;
+  // TODO: maybe use a seqnum heap here, now every call is O(k)
+  for (const auto& iter : iters_) {
+    max_seqnum = std::max(iter->sequence(), max_seqnum);
+  }
+  return max_seqnum != 0 && parsed.sequence < max_seqnum;
+#if 0
   assert(rep_ != nullptr);
   auto& tombstone_map = GetRangeDelMap(parsed.sequence);
   if (tombstone_map.IsEmpty()) {
     return false;
   }
   return tombstone_map.ShouldDelete(parsed, mode);
+#endif
 }
 
 bool RangeDelAggregator::IsRangeOverlapped(const Slice& start,
@@ -439,6 +462,13 @@ Status RangeDelAggregator::AddTombstones(
   if (input == nullptr) {
     return Status::OK();
   }
+  ClampedIterator* iter = new ClampedIterator(
+      std::move(input), icmp_->user_comparator(), smallest, largest);
+  new_iters_.push_back(iter);
+  iters_.push_back(std::unique_ptr<ClampedIterator>(iter));
+  return Status::OK();
+
+#if 0
   input->SeekToFirst();
   bool first_iter = true;
   while (input->Valid()) {
@@ -504,6 +534,7 @@ Status RangeDelAggregator::AddTombstones(
     rep_->pinned_iters_mgr_.PinIterator(input.release(), false /* arena */);
   }
   return Status::OK();
+#endif
 }
 
 void RangeDelAggregator::InvalidateRangeDelMapPositions() {
