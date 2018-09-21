@@ -363,7 +363,8 @@ RangeDelAggregator::RangeDelAggregator(
     bool collapse_deletions /* = true */)
     : upper_bound_(kMaxSequenceNumber),
       icmp_(icmp),
-      collapse_deletions_(collapse_deletions) {
+      collapse_deletions_(collapse_deletions),
+      forward_heap_(ForwardIterHeap(ClampedIteratorForwardComparator(icmp.user_comparator()))) {
   InitRep(snapshots);
 }
 
@@ -372,7 +373,9 @@ RangeDelAggregator::RangeDelAggregator(const InternalKeyComparator& icmp,
                                        bool collapse_deletions /* = false */)
     : upper_bound_(snapshot),
       icmp_(icmp),
-      collapse_deletions_(collapse_deletions) {}
+      collapse_deletions_(collapse_deletions),
+      forward_heap_(ForwardIterHeap(
+          ClampedIteratorForwardComparator(icmp.user_comparator()))) {}
 
 void RangeDelAggregator::InitRep(const std::vector<SequenceNumber>& snapshots) {
   assert(rep_ == nullptr);
@@ -408,23 +411,31 @@ bool RangeDelAggregator::ShouldDeleteImpl(const Slice& internal_key,
 bool RangeDelAggregator::ShouldDeleteImpl(const ParsedInternalKey& parsed,
                                           RangeDelPositioningMode mode) {
   assert(IsValueType(parsed.type));
+  (void)mode;
   // can only add new iters after this loop because they are seeked to latest key
   while (icmp_.user_comparator()->Compare(forward_heap_.top()->boundary(),
                                           parsed.user_key) <= 0) {
     forward_heap_.top()->UpdatePosition(parsed);
+    ClampedIterator* iter = forward_heap_.top();
     if (!forward_heap_.top()->Valid()) {
       forward_heap_.pop();
-      // TODO: remove from iters_ as well
+      iters_.erase(
+          std::remove_if(iters_.begin(), iters_.end(),
+                         [&iter](const std::unique_ptr<ClampedIterator>& it) {
+                           return it.get() == iter;
+                         }),
+          iters_.end());
+    } else {
+      forward_heap_.replace_top(forward_heap_.top());
     }
-    forward_heap_.replace_top();
   }
-  for (auto new_iter : new_iters_) {
-    new_iter.UpdatePosition(parsed);
+  for (const auto& new_iter : new_iters_) {
+    new_iter->UpdatePosition(parsed);
     forward_heap_.push(new_iter);
   }
   new_iters_.clear();
   SequenceNumber max_seqnum = 0;
-  // TODO: maybe use a seqnum heap here, now every call is O(k)
+  // TODO: maybe use a seqnum heap here, now every call is O(k) even when we want best case O(1)
   for (const auto& iter : iters_) {
     max_seqnum = std::max(iter->sequence(), max_seqnum);
   }
@@ -459,11 +470,12 @@ Status RangeDelAggregator::AddTombstones(
     std::unique_ptr<InternalIterator> input,
     const InternalKey* smallest,
     const InternalKey* largest) {
+  (void)upper_bound_;
   if (input == nullptr) {
     return Status::OK();
   }
   ClampedIterator* iter = new ClampedIterator(
-      std::move(input), icmp_->user_comparator(), smallest, largest);
+      std::move(input), icmp_.user_comparator(), smallest, largest);
   new_iters_.push_back(iter);
   iters_.push_back(std::unique_ptr<ClampedIterator>(iter));
   return Status::OK();

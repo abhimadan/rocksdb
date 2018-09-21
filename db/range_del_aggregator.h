@@ -201,8 +201,9 @@ class RangeDelAggregator {
   class ClampedIterator {
    public:
     ClampedIterator(std::unique_ptr<InternalIterator> tombstone_iter,
-                    Comparator* ucmp, InternalKey* smallest = nullptr,
-                    InternalKey* largest = nullptr)
+                    const Comparator* ucmp,
+                    const InternalKey* smallest = nullptr,
+                    const InternalKey* largest = nullptr)
         : tombstone_iter_(std::move(tombstone_iter)),
           ucmp_(ucmp),
           smallest_(smallest),
@@ -218,6 +219,7 @@ class RangeDelAggregator {
     void UpdatePosition(const ParsedInternalKey& parsed) {
       // TODO: account for changing direction as well
       bool updated_position = false;
+      assert(smallest_ == smallest_);
       if (!previously_seeked_) {
         tombstone_iter_->SeekForPrev(parsed.user_key);
         previously_seeked_ = true;
@@ -233,8 +235,8 @@ class RangeDelAggregator {
       }
 
       if (!tombstone_iter_->Valid() ||
-          (largest != nullptr &&
-           ucmp_->Compare(largest->user_key(), parsed.user_key) < 0)) {
+          (largest_ != nullptr &&
+           ucmp_->Compare(largest_->user_key(), parsed.user_key) < 0)) {
         valid_ = false;
         return;
       }
@@ -278,7 +280,7 @@ class RangeDelAggregator {
   };
 
   struct ClampedIteratorForwardComparator {
-    ClampedIteratorComparator(const Comparator* c) : cmp(c) {}
+    ClampedIteratorForwardComparator(const Comparator* c) : cmp(c) {}
 
     bool operator()(ClampedIterator* a, ClampedIterator* b) const {
       return cmp->Compare(a->boundary(), b->boundary()) > 0;
